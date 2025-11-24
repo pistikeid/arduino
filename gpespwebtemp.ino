@@ -5,7 +5,7 @@
   - EEPROM tárolás (thresholds, check interval, preRun, manual pump states)
   - OneWire ROM CRC + scratchpad CRC ellenőrzés
   - Manuális szivattyú kapcsolók (padló / fal) – párhuzamos, "force ON"
-  - Non-blocking állapotgép: IDLE -> PRE_RUN -> RUNNING
+  - Non-blocking állapotgép: IDLE -> PRE_RUN -> Z_WAIT_BOILER -> RUNNING
 */
 
 #include <WebServer.h>
@@ -106,8 +106,8 @@ WebServer server(80);
 long remainingPadlo = 0;
 long remainingFal = 0;
 
-// State machine per zone
-enum ZoneState { Z_IDLE=0, Z_PRE_RUN=1, Z_RUNNING=2 };
+// State machine per zone (Added Z_WAIT_BOILER state)
+enum ZoneState { Z_IDLE=0, Z_PRE_RUN=1, Z_RUNNING=2, Z_WAIT_BOILER=3 };
 
 ZoneState statePadlo = Z_IDLE;
 ZoneState stateFal = Z_IDLE;
@@ -169,7 +169,7 @@ setInterval(function(){
     document.getElementById("remaining-fal").innerHTML = r.remainingFal;
   }};
   xhttp.open("GET","/temperature",true); xhttp.send();
-},2000);
+},3000); // Changed to 3000ms (3 seconds)
 
 setInterval(function(){
   var xhttp=new XMLHttpRequest();
@@ -191,6 +191,7 @@ setInterval(function(){
 void initEEPROMAndLoad();
 void saveAllToEEPROM();
 bool readScratchpadAndCheckCRC(DeviceAddress addr, uint8_t *outScratch);
+String zoneStateToText(ZoneState s);
 
 // === Implementation ===
 
@@ -238,22 +239,19 @@ bool readScratchpadAndCheckCRC(DeviceAddress addr, uint8_t *outScratch) {
     outScratch[i] = oneWire.read();
   }
   uint8_t c = OneWire::crc8(outScratch, 8);
-  if (c != outScratch[8]) {
+  if (c != outScratch[8]) { // JAVÍTVA: outScratch[8] a CRC bájt
     Serial.printf("Scratchpad CRC fail (got 0x%02X expected 0x%02X)\n", outScratch[8], c);
     return false;
   }
   return true;
 }
 
-   //enum ZoneState  { Z_IDLE=0, Z_PRE_RUN=1, Z_RUNNING=2 };
-   String zoneStateToText(ZoneState s);
-
-
-  String zoneStateToText(ZoneState s) {
+String zoneStateToText(ZoneState s) {
   switch(s) {
     case Z_IDLE: return "Idle";
     case Z_PRE_RUN: return "Pre-run";
     case Z_RUNNING: return "Running";
+    case Z_WAIT_BOILER: return "Wait Boiler"; // Added new state text
     default: return "Unknown";
   }
 }
@@ -268,7 +266,7 @@ void initTwoSensors() {
   if (count >= 1) {
     if (sensors.getAddress(addrPadlo, 0)) {
       uint8_t crc = OneWire::crc8(addrPadlo, 7);
-      if (crc == addrPadlo[7]) {
+      if (crc == addrPadlo[7]) { // JAVÍTVA: addrPadlo[7] a ROM CRC bájt
         sensorPadloFound = true;
         Serial.print("Padló sensor addr: ");
         for (int i=0;i<8;i++) Serial.printf("%02X", addrPadlo[i]);
@@ -282,7 +280,7 @@ void initTwoSensors() {
   if (count >= 2) {
     if (sensors.getAddress(addrFal, 1)) {
       uint8_t crc = OneWire::crc8(addrFal, 7);
-      if (crc == addrFal[7]) {
+      if (crc == addrFal[7]) { // JAVÍTVA: addrFal[7] a ROM CRC bájt
         sensorFalFound = true;
         Serial.print("Fal sensor addr: ");
         for (int i=0;i<8;i++) Serial.printf("%02X", addrFal[i]);
@@ -416,9 +414,8 @@ void setup() {
 // Helper to get temperature by DeviceAddress with scratchpad CRC validation
 float getTempForAddr(DeviceAddress a, bool &ok) {
   ok = false;
-  if (!a[0]) return INVALID_TEMP;
-  // request conversion only once in main loop and then read by index — to be simple we read scratchpad here:
-  uint8_t scratch[9];
+  if (!a[0]) return INVALID_TEMP; // JAVÍTVA: Ellenőrzés, hogy a cím érvényes-e (nem csupa nulla)
+  uint8_t scratch[9]; // JAVÍTVA: Tömbként definiálva
   if (!readScratchpadAndCheckCRC(a, scratch)) {
     return INVALID_TEMP;
   }
@@ -467,15 +464,6 @@ void loop() {
   lastTemperature = okPadlo ? String(tPadlo_raw, 2) : String("--");
   lastTemperaturef = okFal ? String(tFal_raw, 2) : String("--");
 
-  // Update remaining countdowns (based on last trigger times)
-  unsigned long nowMs = millis();
-  if (previousMillisp + intervalp > nowMs)
-    remainingPadlo = (previousMillisp + intervalp - nowMs) / 1000;
-  else remainingPadlo = 0;
-  if (previousMillisf + intervalf > nowMs)
-    remainingFal = (previousMillisf + intervalf - nowMs) / 1000;
-  else remainingFal = 0;
-
   // Update trigger timers: if check interval elapsed -> allow next automatic decision
   if (now - previousMillisp >= intervalp) {
     previousMillisp = now;
@@ -503,14 +491,27 @@ void loop() {
       break;
     case Z_PRE_RUN:
       // If manual forced off? manualPadlo == false and user turned off while pre-run active => still allow pre-run to complete? We'll allow manual force ON only; manual OFF does not interrupt pre-run.
-      // When preRunSeconds elapsed -> go to RUNNING
+      // When preRunSeconds elapsed -> go to Z_WAIT_BOILER (new state)
       if (now - stateStartPadlo >= (unsigned long)preRunSeconds * 1000UL) {
-        statePadlo = Z_RUNNING;
-        Serial.println("Padló -> RUNNING (mérés érvényes)");
-        // reset triggertimer so we don't retrigger too fast
-        triggertimer = false;
+        statePadlo = Z_WAIT_BOILER;
+        stateStartPadlo = now; // Reuse stateStartPadlo for boiler wait timer
+        Serial.println("Padló -> Z_WAIT_BOILER (várakozás kazánra)");
       }
       break;
+    case Z_WAIT_BOILER:
+       // Wait 2 seconds, then check temp again before going RUNNING
+       if (now - stateStartPadlo >= 2000UL) { // 2 second wait
+           if (temperature != DEVICE_DISCONNECTED_C && (temperature < inputMessage.toFloat())) {
+               statePadlo = Z_RUNNING;
+               Serial.println("Padló -> RUNNING (mérés érvényes, kazán indul)");
+           } else {
+               statePadlo = Z_IDLE; // Temp rose above threshold during wait? Go IDLE.
+               Serial.println("Padló -> IDLE (temp ok under boiler wait)");
+           }
+           // reset triggertimer so we don't retrigger too fast
+           triggertimer = false;
+       }
+       break;
     case Z_RUNNING:
       // Running -> decide to stop or keep running
       if (!inputMessage2_enabled) {
@@ -561,11 +562,23 @@ void loop() {
       break;
     case Z_PRE_RUN:
       if (now - stateStartFal >= (unsigned long)preRunSeconds * 1000UL) {
-        stateFal = Z_RUNNING;
-        Serial.println("Fal -> RUNNING (mérés érvényes)");
-        triggertimerf = false;
+        stateFal = Z_WAIT_BOILER;
+        stateStartFal = now;
+        Serial.println("Fal -> Z_WAIT_BOILER (várakozás kazánra)");
       }
       break;
+     case Z_WAIT_BOILER:
+       if (now - stateStartFal >= 2000UL) { // 2 second wait
+           if (temperaturef != DEVICE_DISCONNECTED_C && (temperaturef < inputMessagef.toFloat())) {
+               stateFal = Z_RUNNING;
+               Serial.println("Fal -> RUNNING (mérés érvényes, kazán indul)");
+           } else {
+               stateFal = Z_IDLE; // Temp rose above threshold during wait? Go IDLE.
+               Serial.println("Fal -> IDLE (temp ok under boiler wait)");
+           }
+           triggertimerf = false;
+       }
+       break;
     case Z_RUNNING:
       if (!inputMessage4_enabled) {
         if (!manualFal) digitalWrite(outputf, LOW);
@@ -592,6 +605,7 @@ void loop() {
   // We define kazán should be turned ON if any zone is RUNNING and auto logic requests kazán
   bool kazancall = false;
   // For padló: if state is RUNNING and temperature below threshold -> request kazán
+  // NOTE: state must be RUNNING (after pre-run and wait)
   if (statePadlo == Z_RUNNING && temperature != DEVICE_DISCONNECTED_C && (temperature < inputMessage.toFloat())) kazancall = true;
   if (stateFal == Z_RUNNING && temperaturef != DEVICE_DISCONNECTED_C && (temperaturef < inputMessagef.toFloat())) kazancall = true;
 
@@ -602,18 +616,28 @@ void loop() {
     digitalWrite(outputk, LOW);
   }
 
-  // Update remaining display values using state timers
-  if (statePadlo == Z_PRE_RUN) {
-    long elapsed = (now - stateStartPadlo) / 1000;
-    remainingPadlo = preRunSeconds > elapsed ? (preRunSeconds - elapsed) : 0;
-  } else {
-    // show time until next auto check (remainingPadlo already computed above)
-    // leave it as is
+  // --- Módosított Remaining Countdown Logika ---
+  // remainingPadlo/remainingFal are used for display in the UI.
+
+  if (statePadlo == Z_PRE_RUN || statePadlo == Z_WAIT_BOILER) {
+    // Display remaining pre-run + wait time (total time before Z_RUNNING or Z_IDLE decision)
+    long totalWaitMs = (long)preRunSeconds * 1000UL + 2000UL; // preRun + 2 seconds wait
+    long elapsed = (now - stateStartPadlo);
+    remainingPadlo = totalWaitMs > elapsed ? (totalWaitMs - elapsed) / 1000 : 0;
+  } else if (statePadlo == Z_RUNNING) {
+    remainingPadlo = 0; // Fűtés közben nincs visszaszámlálás
   }
-  if (stateFal == Z_PRE_RUN) {
-    long elapsed = (now - stateStartFal) / 1000;
-    remainingFal = preRunSeconds > elapsed ? (preRunSeconds - elapsed) : 0;
+  // Ha Z_IDLE, a korábban kiszámolt idő a következő check-ig (az intervalp timer alapján)
+
+  if (stateFal == Z_PRE_RUN || stateFal == Z_WAIT_BOILER) {
+    long totalWaitMs = (long)preRunSeconds * 1000UL + 2000UL;
+    long elapsed = (now - stateStartFal);
+    remainingFal = totalWaitMs > elapsed ? (totalWaitMs - elapsed) / 1000 : 0;
+  } else if (stateFal == Z_RUNNING) {
+    remainingFal = 0; // Fűtés közben nincs visszaszámlálás
   }
+  // Ha Z_IDLE, a korábban kiszámolt idő a következő check-ig
+
 
   // Save last manual for edge detection
   lastManualPadlo = manualPadlo;
