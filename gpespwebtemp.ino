@@ -230,7 +230,7 @@ void saveAllToEEPROM() {
   offset = writeStringToEEPROM(offset, manualFal ? "true" : "false");
 }
 
-// Read scratchpad with CRC for given address (DeviceAddress is uint8_t[8])
+// Read scratchpad with CRC for given address (DeviceAddress is uint8_t)
 bool readScratchpadAndCheckCRC(DeviceAddress addr, uint8_t *outScratch) {
   oneWire.reset();
   oneWire.select(addr);
@@ -441,6 +441,15 @@ void loop() {
     sensors.requestTemperatures();
     lastConvRequest = now;
   }
+
+  // Update remaining countdowns (based on last trigger times) - Always calculated for IDLE state display
+  unsigned long nowMs = millis();
+  if (previousMillisp + intervalp > nowMs)
+    remainingPadlo = (previousMillisp + intervalp - nowMs) / 1000;
+  else remainingPadlo = 0;
+  if (previousMillisf + intervalf > nowMs)
+    remainingFal = (previousMillisf + intervalf - nowMs) / 1000;
+  else remainingFal = 0;
 
   // read temps from library (getTempCByIndex uses addresses internally)
   float tPadlo_raw = INVALID_TEMP;
